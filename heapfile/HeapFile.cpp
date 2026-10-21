@@ -191,10 +191,57 @@ bool HeapFile::open(const std::string& path,
     // and the header fields in range. On any failure unwind completely
     // (close through the manager, reset the handle) and return false; on
     // success bind schema_/serializer_/record_size_ and mark the file open.
-    (void)path;
-    (void)schema;
-    (void)error;
-    return false;
+    
+    error.clear();
+    if (open_) {
+        error = "Heap file is already open";
+        return false;
+    }
+
+    // The file must already exist, probing through block layer so it doesn't
+    // silently creates the file
+    bufman::File probe;
+    if (!bufman::open_for_read(path, probe, error)) {
+        error = "no heap file at \"" + path + "\" (" + error + ")";
+        return false;
+    }
+    bufman::close(probe);
+
+    // Registering the file with manager
+    if (!manager_.open_file(path, file_, error)) {
+        return false;
+    }
+
+    // Validate block 0: identification, attach, header fields in range.
+    const schema::TupleSerializer serializer(schema);
+    std::size_t frame = 0;
+    bool ok = manager_.pin(file_, 0, frame, error);
+    if (ok) {
+        char *buffer = manager_.frame(frame).buffer;
+        SlottedPage header;
+        header.bind(buffer, serializer.record_size());
+        ok = check_identification(buffer, schema, error) && header.attach(error);
+        if (ok) {
+            const std::uint64_t blocks = bufman::block_count(file_, error);
+            ok = header_fields_in_range(read_header_fields(buffer), blocks, error);
+        }
+        release(manager_, frame, false);
+    }
+
+    // On any failure: close through the manager, reset the handle.
+    if (!ok) {
+        std::string ignored;
+        manager_.close_file(file_, ignored);
+        file_ = bufman::File{};
+        return false;
+    }
+
+    // Success: bind schema_/serializer_/record_size_ and mark it open.
+    schema_ = &schema;
+    serializer_.emplace(schema);
+    record_size_ = serializer_->record_size();
+    open_ = true;
+    return true;
 }
 
 HeapFileIterator HeapFile::scan() {
