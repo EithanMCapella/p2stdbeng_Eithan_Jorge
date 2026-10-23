@@ -182,10 +182,70 @@ bool HeapFile::create(const std::string& path,
     // non-empty path, validate the record size, alloc page 0, format it as
     // a SlottedPage, write the identification record, and close (flushing)
     // the file — leaving this HeapFile closed.
-    (void)path;
-    (void)schema;
-    (void)error;
-    return false;
+    error.clear();
+    if (is_open()) {
+        error = "cannot create \"" + path + "\": this heap file is already open";
+        return false;
+    }
+
+    const schema::TupleSerializer serializer(schema);
+    const std::size_t size = serializer.record_size();
+    if (size == 0) {
+        error = "cannot create \"" + path +
+                "\": the catalog has no record layout (no columns, or "
+                "String columns without declared width)";
+        return false;
+    }
+
+    if (slot_capacity(size) == 0) {
+        error = "cannot create \"" + path + "\": a " +
+                std::to_string(bufman::kPageSize) +
+                "-byte page fits records of at most " +
+                std::to_string(bufman::kPageSize - kPageHeaderSize - 1) +
+                " bytes, the catalog needs " + std::to_string(size);
+        return false;
+    }
+
+    // open_for_append creates the file when missing, so this also covers the
+    // fresh-path case; an existing empty path is allowed.
+    bufman::File file;
+    if (!manager_.open_file(path, file, error)) {
+        return false;
+    }
+    const std::uint64_t blocks = bufman::block_count(file, error);
+    if (!error.empty()) {
+        std::string close_error;
+        manager_.close_file(file, close_error);
+        return false;
+    }
+    if (blocks > 0) {
+        error = "cannot create \"" + path + "\": the file already holds " +
+                std::to_string(blocks) + " block(s)";
+        std::string close_error;
+        manager_.close_file(file, close_error);
+        return false;
+    }
+
+    std::size_t frame = 0;
+    if (!manager_.alloc_page(file, 0, frame, error)) {
+        std::string close_error;
+        manager_.close_file(file, close_error);
+        return false;
+    }
+    SlottedPage header;
+    header.bind(manager_.frame(frame).buffer, size);
+    header.format(); // prev/next default to kNoPage: an empty chain
+    if (!write_identification(manager_.frame(frame).buffer, schema, error)) {
+        release(manager_, frame, false);
+        std::string close_error;
+        manager_.close_file(file, close_error);
+        return false;
+    }
+    release(manager_, frame, true);
+
+    // Write the header back and leave a one-block file on disk.
+    manager_.close_file(file, error);
+    return error.empty();
 }
 
 bool HeapFile::open(const std::string& path,
@@ -197,6 +257,23 @@ bool HeapFile::open(const std::string& path,
     // success bind schema_/serializer_/record_size_ and mark the file open.
     
     error.clear();
+    const schema::TupleSerializer serializer(schema);
+    const std::size_t size = serializer.record_size();
+    if (size == 0) {
+        error = "cannot open \"" + path +
+                "\": the catalog has no record layout (no columns, or "
+                "String columns without declared width)";
+        return false;
+    }
+    if (slot_capacity(size) == 0) {
+        error = "cannot open \"" + path + "\": a " +
+                std::to_string(bufman::kPageSize) +
+                "-byte page fits records of at most " +
+                std::to_string(bufman::kPageSize - kPageHeaderSize - 1) +
+                " bytes, the catalog needs " + std::to_string(size);
+        return false;
+    }
+
     if (open_) {
         error = "Heap file is already open";
         return false;
@@ -217,13 +294,12 @@ bool HeapFile::open(const std::string& path,
     }
 
     // Validate block 0: identification, attach, header fields in range.
-    const schema::TupleSerializer serializer(schema);
     std::size_t frame = 0;
     bool ok = manager_.pin(file_, 0, frame, error);
     if (ok) {
         char *buffer = manager_.frame(frame).buffer;
         SlottedPage header;
-        header.bind(buffer, serializer.record_size());
+        header.bind(buffer, size);
         ok = check_identification(buffer, schema, error) && header.attach(error);
         if (ok) {
             const std::uint64_t blocks = bufman::block_count(file_, error);
