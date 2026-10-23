@@ -163,12 +163,16 @@ HeapFile::HeapFile(bufman::BufferManager& manager) : manager_(manager) {}
 
 bool HeapFile::is_open() const {
     // TODO(student): report whether a file is currently open.
-    return false;
-}
+    return open_;
+    }
 
 bool HeapFile::require_open(std::string& error) const {
     // TODO(student): fail with "heap file is not open" when closed.
-    (void)error;
+    error.clear();
+    if (is_open()) {
+        return true;
+    }
+    error = "heap file is not open";
     return false;
 }
 
