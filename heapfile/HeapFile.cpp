@@ -382,7 +382,7 @@ bool HeapFile::pin_record_page(const RowId row_id, SlottedPage& page,
     // occupied. The caller owns the pin on success.
     error.clear();
     if (row_id.page_id == 0) {
-        error = " row id names the header page";
+        error = "row id names the header page";
         return false;
     }
 
@@ -465,14 +465,10 @@ bool HeapFile::erase(const RowId row_id, std::string& error) {
     const bool was_full = (page.occupied_count() == page.capacity());
     if (was_full && !move_between_lists(false, row_id.page_id, frame, error)) {
         release(manager_, frame, false);
+        return false;
     }
-
-    
-
-
-    (void)row_id;
-    (void)error;
-    return false;
+    page.erase(row_id.slot, error);
+    return manager_.unpin(frame, true, error);
 }
 
 // --- Structure self-check ---------------------------------------------------
@@ -483,16 +479,109 @@ bool HeapFile::check_structure(std::string& error) {
     // every allocated page reachable exactly once, membership matches
     // occupancy, page 0 on no list, the union covering exactly pages
     // 1..next_page_id-1, and every on-disk data page reachable.
-    (void)error;
-    return false;
+    error.clear();
+    if (!require_open(error)) {
+        return false;
+    }
+
+    std::size_t frame = 0;
+    if(!manager_.pin(file_, 0, frame, error)) {
+        return false;
+    }
+
+    char header[bufman::kPageSize];
+    std::memcpy(header, manager_.frame(frame).buffer, sizeof(header));
+    release(manager_, frame, false);
+
+    const std::uint32_t allocated = read_header_fields(header).next_page_id;
+    std::vector<char> seen(allocated, 0);
+
+    // Walk each list from its head, one pin at a time.
+    for (const bool free_list : {true, false}) {
+        const std::string list = free_list ? "free list" : "full list";
+        std::uint32_t prev = kNoPage;
+        std::uint32_t current = page_detail::read_u32(header, head_offset(free_list));
+        while (current != kNoPage)
+        {
+            const std::string at = "page " + std::to_string(current) + " on the " + list;
+            if (current == 0 || current >= allocated)
+            { // header page, or never allocated
+                error = at + " is not an allocated data page";
+                return false;
+            }
+            if (seen[current])
+            {
+                error = at + " is reached twice (a cyclic list, or a page on both lists)";
+                return false;
+            }
+            seen[current] = 1;
+
+            if (!manager_.pin(file_, current, frame, error))
+            {
+                return false;
+            }
+            SlottedPage page;
+            page.bind(manager_.frame(frame).buffer, record_size_);
+            if (!page.attach(error))
+            {
+                release(manager_, frame, false);
+                return false;
+            }
+            const std::uint32_t back = page.prev_page();
+            const std::uint32_t next = page.next_page();
+            const bool full = page.occupied_count() == page.capacity();
+            release(manager_, frame, false);
+
+            if (back != prev)
+            {
+                error = at + " has prev link " + std::to_string(back) +
+                        ", expected " + std::to_string(prev);
+                return false;
+            }
+            if (full == free_list)
+            { // full on the free list, or not full on the full list
+                error = at + (full ? " is full" : " has a free slot");
+                return false;
+            }
+            prev = current;
+            current = next;
+        }
+        // The tail must be where the walk ended (empty list: both kNoPage).
+        const std::uint32_t tail = page_detail::read_u32(header, tail_offset(free_list));
+        if (tail != prev)
+        {
+            error = "the " + list + " tail is " + std::to_string(tail) +
+                    " but the walk ends at " + std::to_string(prev);
+            return false;
+        }
+    }
+
+    // Every allocated page was reached...
+    for (std::uint32_t p = 1; p < allocated; ++p)
+    {
+        if (!seen[p])
+        {
+            error = "page " + std::to_string(p) + " is allocated but on no list";
+            return false;
+        }
+    }
+    // so an unreachable on-disk page can only sit at or past next_page_id.
+    // (A dirty page may not be on disk yet; that direction is fine.)
+    const std::uint64_t blocks = bufman::block_count(file_, error);
+    if (blocks > allocated)
+    {
+        error = "on-disk page " + std::to_string(allocated) +
+                " is not reachable from either list";
+        return false;
+    }
+    return error.empty();
 }
 
 // --- Lifecycle --------------------------------------------------------------
 
 bool HeapFile::resident(std::uint32_t page_id) const {
     // TODO(student): observe the manager's pool.
-    (void)page_id;
-    return false;
+    return open_ && manager_.resident(file_, page_id);
 }
 
 bool HeapFile::close(std::string& error) {
