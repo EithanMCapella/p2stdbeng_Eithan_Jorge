@@ -440,7 +440,16 @@ bool HeapFile::close(std::string& error) {
     // TODO(student): close the file through the manager; reset this
     // HeapFile's state only when that succeeded, so a failed close can be
     // retried.
-    (void)error;
+    if (!require_open(error)) {
+        return false;
+    }
+    manager_.close_file(file_, error);
+    open_ = false;
+    schema_ = nullptr;
+    serializer_.reset();
+    record_size_ = 0;
+    file_ = bufman::File{};
+    return error.empty();
     return false;
 }
 
