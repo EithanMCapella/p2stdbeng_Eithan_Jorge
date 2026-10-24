@@ -380,11 +380,34 @@ bool HeapFile::pin_record_page(const RowId row_id, SlottedPage& page,
     // page and pages beyond the file's extent (resident pages count as
     // existing even before write-back), pin, attach, and require the slot
     // occupied. The caller owns the pin on success.
-    (void)row_id;
-    (void)page;
-    (void)frame;
-    (void)error;
-    return false;
+    error.clear();
+    if (row_id.page_id == 0) {
+        error = " row id names the header page";
+        return false;
+    }
+
+    // Try and pin the page, if all of the frames are already pinned or
+    // if the page doesn't exist. 
+    if (!manager_.pin(file_, row_id.page_id, frame, error)) {
+        return false;
+    }
+
+    page.bind(manager_.frame(frame).buffer, record_size_);
+    if (!page.attach(error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    // false if its pointing to a slot that has no record in it or that is out of range
+    if (!page.is_occupied(row_id.slot, error)) {
+        if (error.empty()) {
+            error = "slot " + std::to_string(row_id.slot) + " on page " +
+                    std::to_string(row_id.page_id) + " is free";
+        }
+        release(manager_, frame, false);
+        return false;
+    }
+    return true;
 }
 
 bool HeapFile::find(const RowId row_id, tuple::Tuple& tuple,
@@ -401,16 +424,52 @@ bool HeapFile::update(const RowId row_id, const tuple::Tuple& tuple,
                       std::string& error) {
     // TODO(student): serialize, pin the record page, overwrite the record
     // in place, and unpin. Occupancy never changes, so no list move.
-    (void)row_id;
-    (void)tuple;
-    (void)error;
-    return false;
+    error.clear();
+    if (!require_open(error)) {
+        return false;
+    }
+
+    std::vector<char> record(record_size_);
+    if (!serializer_->serialize(tuple, record.data(), record.size(), error)) {
+        return false;
+    }
+
+    SlottedPage page;
+    std::size_t frame = 0;
+    if (!pin_record_page(row_id, page, frame, error)) {
+        return false;
+    }
+
+    // Same slot, still occupied so it stays the same as before (size wise)
+    page.put_record(row_id.slot, record.data(), record.size(), error);
+    return manager_.unpin(frame, true, error);
 }
 
 bool HeapFile::erase(const RowId row_id, std::string& error) {
     // TODO(student): pin the record page, note whether the page WAS full,
     // clear the slot's occupancy byte, and move a just-unfilled page back
     // to the free list (at the tail).
+    error.clear();
+    if (!require_open(error)) {
+        return false;
+    }
+
+    SlottedPage page;
+    std::size_t frame = 0;
+    if (!pin_record_page(row_id, page, frame, error)) {
+        return false;
+    }
+
+    // Can fail, a page that was full goes back to the free list's tail.
+    // If that fails, the slot is still occupied and nothing changed.
+    const bool was_full = (page.occupied_count() == page.capacity());
+    if (was_full && !move_between_lists(false, row_id.page_id, frame, error)) {
+        release(manager_, frame, false);
+    }
+
+    
+
+
     (void)row_id;
     (void)error;
     return false;
