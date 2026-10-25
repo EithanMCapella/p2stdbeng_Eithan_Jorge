@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <bits/codecvt.h>
 
 // ============================================================================
 // HeapFile — STUDENT IMPLEMENTATION FILE
@@ -328,7 +329,19 @@ HeapFileIterator HeapFile::scan() {
     // TODO(student): pin the header once, read the two list heads and
     // next_page_id, unpin, and return an iterator seeded with them. A
     // closed file yields an exhausted iterator.
-    return HeapFileIterator(*this, kNoPage, kNoPage, 1);
+    if (!is_open()) {
+        return HeapFileIterator(*this, kNoPage, kNoPage, 1);
+    }
+    std::string error;
+    std::size_t frame = 0;
+    if (!manager_.pin(file_, 0, frame, error)) {
+        return HeapFileIterator(*this, kNoPage, kNoPage, 1);
+    }
+
+    const HeaderFields h = read_header_fields(manager_.frame(frame).buffer);
+    release(manager_, frame, false);
+    return HeapFileIterator(*this, h.free_head, h.full_head, h.next_page_id);
+
 }
 
 // --- List surgery -----------------------------------------------------------
@@ -418,7 +431,7 @@ bool HeapFile::insert(const tuple::Tuple& tuple, RowId& row_id,
     }
     release(manager_, frame, false);
 
-    //If there is still a page, then we pin and attatch
+    //If there is still a page, then we pin and attach
     std::uint32_t page_id;
     if (h.free_head != kNoPage) {
         page_id = h.free_head;
@@ -712,8 +725,77 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
     // occupied slot's decoded record, remembering the slot to resume from.
     // Exhaustion is false with an EMPTY error; a revisited page means a
     // cyclic list and is a named failure.
-    (void)tuple;
-    (void)error;
+
+    error.clear();
+    if(!file_->is_open()) {
+        error = "heap file is not open";
+        return false;
+    }
+
+    std::array<char, bufman::kPageSize> record{};
+
+    while (true) {
+        // If both lists are done exit
+        if (page_id_ == kNoPage) { // free head
+            if (next_list_ == kNoPage) { //head of list to be walked after current one; full head
+                return false;
+            }
+            page_id_ = next_list_; // switch to the full list
+            next_list_ = kNoPage; // if in full there is no other list
+            slot_ = 0;
+        }
+
+
+        std::size_t frame = 0;
+        //pin the current page
+        if (!file_->manager_.pin(file_->file_, page_id_, frame, error)) {
+            return false;
+        }
+        const HeaderFields h = read_header_fields(file_->manager_.frame(frame).buffer);
+        SlottedPage page;
+        page.bind(file_->manager_.frame(frame).buffer, file_->record_size_);
+
+        if (!page.attach(error)) {
+            release(file_->manager_, frame, false);
+            return false;
+        }
+
+        const std::uint32_t next_page_id = page.next_page();
+        bool found = false;
+        for (std::uint32_t slot = slot_; slot < page.capacity(); ++slot) {
+            if (!page.is_occupied(slot, error)) {
+                continue;
+            }
+            if (!page.get_record(slot, record.data(), record.size(), error)) {
+                release(file_->manager_, frame, false);
+                return false;
+            }
+            // Copy first, decode after the pin is released: the record
+            // bytes live in the frame buffer only while it stays pinned.
+            release(file_->manager_, frame, false);
+            if (!file_->serializer_->deserialize(record.data(), record.size(),
+                                                 tuple, error)) {
+                return false;
+                                                 }
+            current_ = RowId{page_id_, slot};
+            if (slot + 1 < page.capacity()) {
+                slot_ = slot + 1; // stay on this page
+            } else {
+                page_id_ = next_page_id;
+                slot_ = 0;
+            }
+            found = true;
+            break;
+        }
+        if (found) {
+            return true;
+        }
+        release(file_->manager_, frame, false);
+        // Page exhausted from slot_ on: continue with the next one.
+        page_id_ = next_page_id;
+        slot_ = 0;
+    }
+    // exhausted
     return false;
 }
 
