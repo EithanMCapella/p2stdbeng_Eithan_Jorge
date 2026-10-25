@@ -339,10 +339,33 @@ bool HeapFile::append_fresh_page(std::uint32_t page_id, std::size_t page_frame,
     // element (head and tail) and advance next_page_id past it; clear the
     // page's own links. Only called right after an allocation, when the
     // free list is empty by construction — refuse otherwise.
-    (void)page_id;
-    (void)page_frame;
-    (void)error;
-    return false;
+    error.clear();
+    std::size_t frame = 0;
+    if (!manager_.pin(file_, 0, frame, error)) {
+        return false;
+    }
+
+    // Refusal
+    HeaderFields h = read_header_fields(manager_.frame(frame).buffer);
+    if (h.free_head != kNoPage) {
+        release(manager_, frame, false);
+        error = "append_fresh_page, free list is not empty, refusing";
+        return false;
+    }
+    // The allocated page comes the free list's only element
+    h.free_head = page_id;
+    h.free_tail = page_id;
+    h.next_page_id = page_id + 1;
+    write_header_fields(manager_.frame(frame).buffer, h);
+
+    // Clear the page's own Links
+    SlottedPage page;
+    page.bind(manager_.frame(page_frame).buffer, record_size_);
+    page.set_prev_page(kNoPage);
+    page.set_next_page(kNoPage);
+
+    release(manager_, frame, true);
+    return true;
 }
 
 bool HeapFile::move_between_lists(bool to_full, std::uint32_t page_id,
@@ -368,10 +391,81 @@ bool HeapFile::insert(const tuple::Tuple& tuple, RowId& row_id,
     // the free list when the free list is empty — store the record in the
     // target's first free slot, and move the page to the full list when
     // its last free slot was taken. Report the new row id.
-    (void)tuple;
-    (void)row_id;
-    (void)error;
-    return false;
+    error.clear();
+    if (!require_open(error)) {
+        return false;
+    }
+
+    // Serialize it against the schema, and check if it fails before any page is pinned.
+    std::array<char, bufman::kPageSize> record{};
+    if (!serializer_->serialize(tuple, record.data(), record.size(), error)) {
+        return false;
+    }
+
+    // Header file
+    std::size_t frame = 0;
+    if (!manager_.pin(file_, 0, frame, error) ) {
+        return false;
+    }
+
+
+    const HeaderFields h = read_header_fields(manager_.frame(frame).buffer);
+    SlottedPage page;
+    page.bind(manager_.frame(frame).buffer, record_size_);
+    if (!page.attach(error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+    release(manager_, frame, false);
+
+    //If there is still a page, then we pin and attatch
+    std::uint32_t page_id;
+    if (h.free_head != kNoPage) {
+        page_id = h.free_head;
+        if (!manager_.pin(file_, page_id, frame, error)) {
+            return false;
+        }
+        page.bind(manager_.frame(frame).buffer, record_size_);
+        if (!page.attach(error)) {
+            release(manager_, frame, false);
+            return false;
+        }
+
+    }
+    else {
+        page_id = h.next_page_id;
+        if (!manager_.alloc_page(file_, page_id, frame, error)) {
+            std::string close_error;
+            return false;
+        }
+        page.bind(manager_.frame(frame).buffer, record_size_);
+        page.format();
+
+        if (!append_fresh_page(page_id, frame, error)) {
+            release(manager_, frame, false);
+            return false;
+        }
+
+    }
+
+    const std::optional<std::size_t> slot = page.first_free_slot();
+
+    if (!page.put_record(*slot, record.data(), record_size_, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+    row_id = RowId{page_id, static_cast<std::uint32_t>(*slot)};
+    if (!page.has_free_slot()) {
+        if (!move_between_lists(true, page_id, frame, error)) {
+            page.erase(*slot, error);
+            release(manager_, frame, false);
+            return false;
+        }
+    }
+    release(manager_, frame, true);
+    return true;
+
+
 }
 
 bool HeapFile::pin_record_page(const RowId row_id, SlottedPage& page,
