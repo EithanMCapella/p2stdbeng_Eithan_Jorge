@@ -375,11 +375,87 @@ bool HeapFile::move_between_lists(bool to_full, std::uint32_t page_id,
     // destination list's tail. Acquire ALL auxiliary pins first (header +
     // source neighbors + destination tail) in ascending page-id order;
     // after that the surgery is pure memory writes.
-    (void)to_full;
-    (void)page_id;
-    (void)page_frame;
-    (void)error;
-    return false;
+    error.clear();
+
+    // The moving page, getting its information
+    SlottedPage moving;
+    moving.bind(manager_.frame(page_frame).buffer, record_size_);
+    const std::uint32_t prev = moving.prev_page();
+    const std::uint32_t next = moving.next_page();
+
+    // Taking every pin, in ascending page_id order. The header goes first
+    // since its page 0, it gives us the destination list's tail
+    std::size_t header_frame = 0;
+    if (!manager_.pin(file_, 0, header_frame, error)) {
+        return false; 
+    }
+    char* header = manager_.frame(header_frame).buffer;
+    const std::uint32_t dest_tail = page_detail::read_u32(header, tail_offset(!to_full)); // tail_offset ask if free list, thats why `!` is added
+
+    // Sort the (up to three) auxiliary ids, header always pinned.
+    // prev, next, and destination tail`
+    std::uint32_t ids[3] = {prev, next, dest_tail};
+    const auto order = [](std::uint32_t &a, std::uint32_t &b) {
+        if (a > b) {
+            const std::uint32_t t = a;
+            a = b;
+            b = t;
+        }
+    };
+    order(ids[0], ids[1]);
+    order(ids[1], ids[2]);
+    order(ids[0], ids[1]);
+
+    std::size_t frames[3] = {0, 0, 0};
+    std::size_t pinned = 0;
+    while (pinned < 3 && ids[pinned] != kNoPage) {
+        if (!manager_.pin(file_, ids[pinned], frames[pinned], error)) {
+            for (std::size_t i = 0; i < pinned; ++i) {
+                release(manager_, frames[i], false);
+            }
+            release(manager_, header_frame, false);
+            return false; // nothing written yet, the file remains unchanged
+        }
+        ++pinned;
+    }
+    const auto page_at = [&](std::uint32_t id) {
+        SlottedPage page;
+        for (std::size_t i = 0; i < pinned; ++i) {
+            if (ids[i] == id) {
+                page.bind(manager_.frame(frames[i]).buffer, record_size_);
+            }
+        }
+        return page;
+    };
+
+    // Detach from the source list.
+    if (prev != kNoPage) {
+        page_at(prev).set_next_page(next);
+    }
+    else {
+        page_detail::write_u32(header, head_offset(to_full), next);
+    }
+    if (next != kNoPage) {
+        page_at(next).set_prev_page(prev); }
+    else {
+        page_detail::write_u32(header, tail_offset(to_full), prev);
+    }
+    // Append at the destination list's tail.
+    moving.set_prev_page(dest_tail);
+    moving.set_next_page(kNoPage);
+    if (dest_tail != kNoPage) {
+        page_at(dest_tail).set_next_page(page_id);
+    }
+    else {
+        page_detail::write_u32(header, head_offset(!to_full), page_id);
+    }
+    page_detail::write_u32(header, tail_offset(!to_full), page_id);
+
+    for (std::size_t i = 0; i < pinned; ++i) {
+        release(manager_, frames[i], true);
+    }
+    release(manager_, header_frame, true);
+    return true;
 }
 
 // --- Row operations ---------------------------------------------------------
