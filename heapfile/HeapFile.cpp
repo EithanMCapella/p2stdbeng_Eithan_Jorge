@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-#include <bits/codecvt.h>
+// #include <bits/codecvt.h>
 
 // ============================================================================
 // HeapFile — STUDENT IMPLEMENTATION FILE
@@ -597,10 +597,21 @@ bool HeapFile::find(const RowId row_id, tuple::Tuple& tuple,
                     std::string& error) {
     // TODO(student): pin the record page, copy the record out, unpin, and
     // deserialize into `tuple`.
-    (void)row_id;
-    (void)tuple;
-    (void)error;
-    return false;
+    error.clear();
+    if (!require_open(error)) {
+        return false;
+    }
+    SlottedPage page;
+    std::size_t frame = 0;
+    if (!pin_record_page(row_id, page, frame, error)) {
+        return false;
+    }
+
+    std::vector<char> record(record_size_);
+    page.get_record(row_id.slot, record.data(), record.size(), error);
+    release(manager_, frame, false);
+    return serializer_->deserialize(record.data(), record.size(), tuple, error);
+
 }
 
 bool HeapFile::update(const RowId row_id, const tuple::Tuple& tuple,
