@@ -832,13 +832,25 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
             slot_ = 0;
         }
 
+        if (iterating_ != page_id_) {
+            //started a new page
+            if (page_id_ == 0 || page_id_ >= seen_.size()) {
+                error = "page " + std::to_string(page_id_) + " is not allocated inside seen_";
+                return false;
+            }
+            if (seen_[page_id_]) {
+                error = "page " + std::to_string(page_id_) + " has been reached twice, the list is cyclic";
+                return false;
+            }
+            // If page is allocated and hasn't been seen we are now in the middle of this page
+            iterating_ = page_id_;
+        }
 
         std::size_t frame = 0;
         //pin the current page
         if (!file_->manager_.pin(file_->file_, page_id_, frame, error)) {
             return false;
         }
-        const HeaderFields h = read_header_fields(file_->manager_.frame(frame).buffer);
         SlottedPage page;
         page.bind(file_->manager_.frame(frame).buffer, file_->record_size_);
 
@@ -868,6 +880,10 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
             if (slot + 1 < page.capacity()) {
                 slot_ = slot + 1; // stay on this page
             } else {
+                // When leaving the page, update seen_ status
+                seen_[page_id_] = 1;
+                iterating_ = kNoPage;
+
                 page_id_ = next_page_id;
                 slot_ = 0;
             }
@@ -878,6 +894,9 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
             return true;
         }
         release(file_->manager_, frame, false);
+        seen_[page_id_] = 1;
+        iterating_ = kNoPage;
+
         // Page exhausted from slot_ on: continue with the next one.
         page_id_ = next_page_id;
         slot_ = 0;
