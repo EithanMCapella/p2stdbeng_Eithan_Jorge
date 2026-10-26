@@ -834,9 +834,10 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
             slot_ = 0;
         }
 
+        // Check Cycles
         if (iterating_ != page_id_) {
             //started a new page
-            if (page_id_ == 0 || page_id_ >= seen_.size()) {
+            if (page_id_ == 0 || page_id_ >= seen_.size()) { //seen_ updates with scan() since that is what allocates
                 error = "page " + std::to_string(page_id_) + " is not allocated inside seen_";
                 return false;
             }
@@ -845,6 +846,7 @@ bool HeapFileIterator::next(tuple::Tuple& tuple, std::string& error) {
                 return false;
             }
             // If page is allocated and hasn't been seen we are now in the middle of this page
+            // Hence a new page we haven't seen and we can continue iterating
             iterating_ = page_id_;
         }
 
